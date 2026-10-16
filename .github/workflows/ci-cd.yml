@@ -1,0 +1,133 @@
+
+name: Sweetcrumb Bakery CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bakery-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ========================================
+  # JOB 1: CODE QUALITY
+  # ========================================
+  code-quality:
+    name: Lint, TypeScript and Build Checks
+
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: bakery-backend
+        shell: bash
+
+    steps:
+
+      # ====================================
+      # STAGE 1: CHECKOUT
+      # ====================================
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # ====================================
+      # STAGE 2: NODE.JS SETUP
+      # ====================================
+      - name: Configure Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Activate pinned pnpm
+        run: corepack prepare pnpm@12.11.2 --activate
+
+      # ====================================
+      # STAGE 3: DEPENDENCIES
+      # ====================================
+      - name: Verify backend project files
+        run: |
+          echo "Current working directory:"
+          pwd
+
+          echo "Checking package.json..."
+          test -f package.json
+
+          echo "Checking pnpm-lock.yaml..."
+          test -f pnpm-lock.yaml
+
+          echo "Checking pnpm-workspace.yaml..."
+          test -f pnpm-workspace.yaml
+
+          echo "Backend project files verified."
+
+      - name: Install dependencies
+        env:
+          NODE_ENV: development
+        run: pnpm install --frozen-lockfile --prod=false
+
+      # ====================================
+      # STAGE 4: LINT
+      # ====================================
+      - name: Verify ESLint installation
+        run: |
+          echo "Checking pnpm version..."
+          pnpm --version
+
+          echo "Checking ESLint dependency..."
+          pnpm list eslint --depth 0
+
+          echo "Checking ESLint executable..."
+          pnpm exec eslint --version
+
+      - name: Run ESLint
+        run: pnpm exec eslint .
+
+      # ====================================
+      # STAGE 5: TYPESCRIPT
+      # ====================================
+      - name: Verify TypeScript installation
+        run: pnpm exec tsc --version
+
+      - name: Run TypeScript checks
+        run: pnpm exec tsc --noEmit
+
+      # ====================================
+      # STAGE 6: BUILD VALIDATION
+      # ====================================
+      - name: Validate production build
+        env:
+          NODE_ENV: production
+          PAYLOAD_SECRET: ci-build-only-secret-not-for-production
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+          NEXT_PUBLIC_SERVER_URL: http://localhost:3002
+        run: pnpm build
+
+      # ====================================
+      # STAGE 7: BUILD SUMMARY
+      # ====================================
+      - name: Publish CI summary
+        if: always()
+        run: |
+          {
+            echo "## Sweetcrumb Bakery CI"
+            echo ""
+            echo "- Node.js: 22"
+            echo "- pnpm: 12.11.2"
+            echo "- Backend: bakery-backend"
+            echo "- Workflow result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"

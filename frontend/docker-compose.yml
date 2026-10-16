@@ -1,0 +1,53 @@
+
+name: bakery-frontend
+
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: "http://localhost:3001"
+
+    image: bakery-frontend:local
+    container_name: bakery-frontend
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:3000:3000"
+
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+
+      # Browser requests
+      NEXT_PUBLIC_API_URL: "http://localhost:3001"
+
+      # Server-side requests inside Docker
+      PAYLOAD_API_URL: "http://payload:3000"
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    networks:
+      - bakery-shared
+
+networks:
+  bakery-shared:
+    external: true

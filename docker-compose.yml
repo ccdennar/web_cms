@@ -1,0 +1,207 @@
+
+name: sweetcrumb-bakery
+
+services:
+
+  # ==========================================
+  # SERVICE 1: SQLITE BACKUP / INITIALIZATION
+  # ==========================================
+  # Retained temporarily for migration.
+  sqlite-init:
+    image: alpine:3.22
+    restart: "no"
+
+    volumes:
+      - sqlite_data:/data
+      - ./bakery-backend/payload.db:/seed/payload.db:ro
+
+    entrypoint: ["/bin/sh", "-c"]
+
+    command:
+      - |
+        set -eu
+
+        echo "Checking existing SQLite database..."
+
+        if [ ! -f /data/payload.db ]; then
+          if [ ! -f /seed/payload.db ]; then
+            echo "SQLite seed database missing."
+            exit 1
+          fi
+
+          cp /seed/payload.db /data/payload.db
+          echo "SQLite database initialized."
+        else
+          echo "Existing SQLite database preserved."
+        fi
+
+        chown -R 1001:0 /data
+        chmod -R g+rwX /data
+
+    networks:
+      - bakery-network
+
+  # ==========================================
+  # SERVICE 2: POSTGRESQL DATABASE
+  # ==========================================
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: sweetcrumb
+      POSTGRES_USER: sweetcrumb
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U sweetcrumb -d sweetcrumb
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - bakery-network
+
+  # ==========================================
+  # SERVICE 3: PAYLOAD CMS BACKEND
+  # ==========================================
+  payload:
+    build:
+      context: ./bakery-backend
+      dockerfile: Dockerfile
+
+    image: bakery-backend:local
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    ports:
+      - "127.0.0.1:3001:3000"
+
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+
+      # PostgreSQL connection
+      DATABASE_URL: "postgresql://sweetcrumb:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/sweetcrumb"
+
+      # Public CMS URL
+      NEXT_PUBLIC_SERVER_URL: "http://localhost:3001"
+
+      # Payload CMS secret
+      PAYLOAD_SECRET: "${PAYLOAD_SECRET:?PAYLOAD_SECRET must be set}"
+
+    volumes:
+      # Preserve the existing SQLite database
+      # for migration and rollback.
+      - sqlite_data:/app/data
+
+      # Persistent uploaded media
+      - media_data:/app/media
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    networks:
+      - bakery-network
+
+  # ==========================================
+  # SERVICE 4: NEXT.JS FRONTEND
+  # ==========================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: "http://localhost:3001"
+
+    image: bakery-frontend:local
+    restart: unless-stopped
+
+    depends_on:
+      payload:
+        condition: service_healthy
+
+    ports:
+      - "127.0.0.1:3000:3000"
+
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+
+      # Server-side access to Payload
+      PAYLOAD_API_URL: "http://payload:3000"
+
+      # Browser-side access to Payload
+      NEXT_PUBLIC_API_URL: "http://localhost:3001"
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    networks:
+      - bakery-network
+
+# ==========================================
+# PERSISTENT VOLUMES
+# ==========================================
+volumes:
+
+  # Existing SQLite data
+  sqlite_data:
+    name: sweetcrumb-bakery_sqlite_data
+
+  # New PostgreSQL data
+  postgres_data:
+    name: sweetcrumb-bakery_postgres_data
+
+  # Existing uploaded images
+  media_data:
+    name: sweetcrumb-bakery_media_data
+
+# ==========================================
+# DOCKER NETWORK
+# ==========================================
+networks:
+  bakery-network:
+    driver: bridge
