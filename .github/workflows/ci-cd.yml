@@ -81,18 +81,18 @@ jobs:
         run: pnpm install --frozen-lockfile --prod=false
 
       # ====================================
-      # STAGE 4: LINT
-      # ====================================
-      - name: Verify ESLint installation
+# STAGE 4: LINT
+# ====================================
+      - name: Verify ESLint dependencies
         run: |
-          echo "Checking pnpm version..."
-          pnpm --version
-
-          echo "Checking ESLint dependency..."
-          pnpm list eslint --depth 0
-
-          echo "Checking ESLint executable..."
+          echo "ESLint version:"
           pnpm exec eslint --version
+
+          echo "ESLint compatibility package:"
+          pnpm list @eslint/eslintrc --depth 0
+
+          echo "Next.js ESLint configuration:"
+          pnpm list eslint-config-next --depth 0
 
       - name: Run ESLint
         run: pnpm exec eslint .
