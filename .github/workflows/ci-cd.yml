@@ -1,6 +1,9 @@
 
 name: Sweetcrumb Bakery CI/CD
 
+# ============================================
+# WORKFLOW TRIGGERS
+# ============================================
 on:
   push:
     branches:
@@ -12,20 +15,26 @@ on:
 
   workflow_dispatch:
 
+# ============================================
+# GITHUB ACTIONS PERMISSIONS
+# ============================================
 permissions:
   contents: read
 
+# ============================================
+# CONCURRENCY
+# ============================================
 concurrency:
   group: bakery-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
 
-  # ========================================
-  # JOB 1: CODE QUALITY
-  # ========================================
+  # ==========================================
+  # JOB 1: BACKEND CODE QUALITY
+  # ==========================================
   code-quality:
-    name: Lint, TypeScript and Build Checks
+    name: Backend Lint, TypeScript and Build
 
     runs-on: ubuntu-latest
 
@@ -34,33 +43,50 @@ jobs:
         working-directory: bakery-backend
         shell: bash
 
+    env:
+      CI: "true"
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
     steps:
 
-      # ====================================
-      # STAGE 1: CHECKOUT
-      # ====================================
+      # ======================================
+      # STAGE 1: CHECKOUT SOURCE CODE
+      # ======================================
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      # ====================================
-      # STAGE 2: NODE.JS SETUP
-      # ====================================
+      # ======================================
+      # STAGE 2: CONFIGURE NODE.JS
+      # ======================================
       - name: Configure Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
+      # ======================================
+      # STAGE 3: CONFIGURE PNPM
+      # ======================================
       - name: Enable Corepack
         run: corepack enable
 
       - name: Activate pinned pnpm
         run: corepack prepare pnpm@12.11.2 --activate
 
-      # ====================================
-      # STAGE 3: DEPENDENCIES
-      # ====================================
+      - name: Verify Node.js and pnpm
+        run: |
+          echo "Node.js version:"
+          node --version
+
+          echo "pnpm version:"
+          pnpm --version
+
+      # ======================================
+      # STAGE 4: VERIFY PROJECT FILES
+      # ======================================
       - name: Verify backend project files
         run: |
+          set -euo pipefail
+
           echo "Current working directory:"
           pwd
 
@@ -73,61 +99,89 @@ jobs:
           echo "Checking pnpm-workspace.yaml..."
           test -f pnpm-workspace.yaml
 
-          echo "Backend project files verified."
+          echo "Checking ESLint configuration..."
+          test -f eslint.config.mjs
 
+          echo "All required project files exist."
+
+      # ======================================
+      # STAGE 5: INSTALL DEPENDENCIES
+      # ======================================
       - name: Install dependencies
         env:
           NODE_ENV: development
         run: pnpm install --frozen-lockfile --prod=false
 
-      # ====================================
-# STAGE 4: LINT
-# ====================================
-      - name: Verify ESLint dependencies
-        run: |
-          echo "ESLint version:"
-          pnpm exec eslint --version
+      # ======================================
+      # STAGE 6: VERIFY ESLINT
+      # ======================================
+      - name: Verify ESLint installation
+        run: pnpm exec eslint --version
 
-          echo "ESLint compatibility package:"
-          pnpm list @eslint/eslintrc --depth 0
-
-          echo "Next.js ESLint configuration:"
-          pnpm list eslint-config-next --depth 0
-
+      # ======================================
+      # STAGE 7: RUN ESLINT
+      # ======================================
       - name: Run ESLint
         run: pnpm exec eslint .
 
-      # ====================================
-      # STAGE 5: TYPESCRIPT
-      # ====================================
+      # ======================================
+      # STAGE 8: VERIFY TYPESCRIPT
+      # ======================================
       - name: Verify TypeScript installation
         run: pnpm exec tsc --version
 
+      # ======================================
+      # STAGE 9: TYPESCRIPT CHECKS
+      # ======================================
       - name: Run TypeScript checks
         run: pnpm exec tsc --noEmit
 
-      # ====================================
-      # STAGE 6: BUILD VALIDATION
-      # ====================================
+      # ======================================
+      # STAGE 10: NEXT.JS PRODUCTION BUILD
+      # ======================================
       - name: Validate production build
         env:
           NODE_ENV: production
           PAYLOAD_SECRET: ci-build-only-secret-not-for-production
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
           NEXT_PUBLIC_SERVER_URL: http://localhost:3002
+
         run: pnpm build
 
-      # ====================================
-      # STAGE 7: BUILD SUMMARY
-      # ====================================
+      # ======================================
+      # STAGE 11: VERIFY BUILD OUTPUT
+      # ======================================
+      - name: Verify standalone build
+        run: |
+          set -euo pipefail
+
+          echo "Checking standalone server..."
+          test -f .next/standalone/server.js
+
+          echo "Checking static assets..."
+          test -d .next/static
+
+          echo "Next.js standalone build verified."
+
+      # ======================================
+      # STAGE 12: PUBLISH CI SUMMARY
+      # ======================================
       - name: Publish CI summary
         if: always()
+        env:
+          JOB_RESULT: ${{ job.status }}
+
         run: |
           {
-            echo "## Sweetcrumb Bakery CI"
+            echo "## Sweetcrumb Bakery CI/CD"
             echo ""
-            echo "- Node.js: 22"
-            echo "- pnpm: 12.11.2"
-            echo "- Backend: bakery-backend"
-            echo "- Workflow result: ${{ job.status }}"
+            echo "| Check | Configuration |"
+            echo "|---|---|"
+            echo "| Node.js | 22 |"
+            echo "| pnpm | 12.11.2 |"
+            echo "| ESLint | 9.x |"
+            echo "| TypeScript | Enabled |"
+            echo "| Next.js | Standalone |"
+            echo "| Backend | bakery-backend |"
+            echo "| Job Result | ${JOB_RESULT} |"
           } >> "$GITHUB_STEP_SUMMARY"
