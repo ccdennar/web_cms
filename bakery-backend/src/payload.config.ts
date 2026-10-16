@@ -104,3 +104,8 @@ export default buildConfig({
   },
 
 })
+postgresAdapter({
+  pool: {
+    connectionString: process.env.DATABASE_URI || '',  // ← or a hardcoded default
+  },
+})

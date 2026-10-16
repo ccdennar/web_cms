@@ -1,4 +1,3 @@
-// Any setup scripts you might need go here
-
-// Load .env files
-import 'dotenv/config'
+import dotenv from 'dotenv'
+dotenv.config({ path: 'test.env' })   // test-specific overrides
+dotenv.config()                        // fall back to .env
