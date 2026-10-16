@@ -168,7 +168,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=bakery-backend
 
       - name: Trivy — dependency scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           scan-type: fs
           scan-ref: ${{ env.BACKEND_DIR }}/pnpm-lock.yaml
@@ -177,7 +177,7 @@ jobs:
           severity: CRITICAL,HIGH
 
       - name: Trivy — image scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           scan-type: image
           image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
@@ -203,7 +203,7 @@ jobs:
 
       # Fail the pipeline if the IMAGE has fixable CRITICAL vulnerabilities
       - name: Trivy — gate on critical image vulnerabilities
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           scan-type: image
           image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
