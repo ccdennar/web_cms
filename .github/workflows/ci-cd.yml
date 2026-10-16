@@ -89,8 +89,7 @@ jobs:
 
       # 6. Execute unit tests (Vitest)
       - name: Run unit tests
-        run: pnpm test:unit -- --reporter=default --reporter=junit --outputFile=test-results/unit.xml
-        # verify script names: test:unit / test:int — adjust to your package.json
+        run: pnpm test:int -- --reporter=default --reporter=junit --outputFile=test-results/unit.xml
 
       # 7. Execute integration tests with PostgreSQL
       - name: Run integration tests
