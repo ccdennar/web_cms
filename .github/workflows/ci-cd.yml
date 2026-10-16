@@ -15,8 +15,11 @@ on:
 
 env:
   BACKEND_DIR: bakery-backend
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/sweetcrumb-bakery-backend
-  NODE_VERSION: 22
+  IMAGE_NAME: ghcr.io/ccdennar/sweetcrumb-bakery-backend
+  NODE_VERSION: "22"
+
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/payload_test
+  PAYLOAD_SECRET: ${PAYLOAD_SECRET}
 
 permissions:
   contents: read
