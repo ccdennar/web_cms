@@ -1,187 +1,343 @@
+name: CI/CD
 
-name: Sweetcrumb Bakery CI/CD
-
-# ============================================
-# WORKFLOW TRIGGERS
-# ============================================
 on:
   push:
-    branches:
-      - main
-
+    branches: [main]
+    paths:
+      - 'bakery-backend/**'
+      - '.github/workflows/ci-cd.yml'
   pull_request:
-    branches:
-      - main
-
+    branches: [main]
+    paths:
+      - 'bakery-backend/**'
+      - '.github/workflows/ci-cd.yml'
   workflow_dispatch:
 
-# ============================================
-# GITHUB ACTIONS PERMISSIONS
-# ============================================
+env:
+  BACKEND_DIR: bakery-backend
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/sweetcrumb-bakery-backend
+  NODE_VERSION: 22
+
 permissions:
   contents: read
 
-# ============================================
-# CONCURRENCY
-# ============================================
-concurrency:
-  group: bakery-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-
-  # ==========================================
-  # JOB 1: BACKEND CODE QUALITY
-  # ==========================================
-  code-quality:
-    name: Backend Lint, TypeScript and Build
-
+  # ─────────────────────────────────────────────────────────────
+  # 1–7: Build & Test
+  # ─────────────────────────────────────────────────────────────
+  build-and-test:
+    name: Lint · Typecheck · Test · Build
     runs-on: ubuntu-latest
-
     defaults:
       run:
-        working-directory: bakery-backend
-        shell: bash
+        working-directory: ${{ env.BACKEND_DIR }}
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: payload
+          POSTGRES_PASSWORD: payload
+          POSTGRES_DB: payload_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payload -d payload_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     env:
-      CI: "true"
-      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      DATABASE_URI: postgresql://payload:payload@localhost:5432/payload_test
+      PAYLOAD_SECRET: ci-test-secret-not-real
 
     steps:
-
-      # ======================================
-      # STAGE 1: CHECKOUT SOURCE CODE
-      # ======================================
-      - name: Checkout source code
+      # 1. Checkout source code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ======================================
-      # STAGE 2: CONFIGURE NODE.JS
-      # ======================================
-      - name: Configure Node.js
+      # 2. Configure Node.js (+ pnpm)
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10 # must match packageManager in package.json
+          run_install: false
+
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: ${{ env.BACKEND_DIR }}/pnpm-lock.yaml
 
-      # ======================================
-      # STAGE 3: CONFIGURE PNPM
-      # ======================================
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Activate pinned pnpm
-        run: corepack prepare pnpm@12.11.2 --activate
-
-      - name: Verify Node.js and pnpm
-        run: |
-          echo "Node.js version:"
-          node --version
-
-          echo "pnpm version:"
-          pnpm --version
-
-      # ======================================
-      # STAGE 4: VERIFY PROJECT FILES
-      # ======================================
-      - name: Verify backend project files
-        run: |
-          set -euo pipefail
-
-          echo "Current working directory:"
-          pwd
-
-          echo "Checking package.json..."
-          test -f package.json
-
-          echo "Checking pnpm-lock.yaml..."
-          test -f pnpm-lock.yaml
-
-          echo "Checking pnpm-workspace.yaml..."
-          test -f pnpm-workspace.yaml
-
-          echo "Checking ESLint configuration..."
-          test -f eslint.config.mjs
-
-          echo "All required project files exist."
-
-      # ======================================
-      # STAGE 5: INSTALL DEPENDENCIES
-      # ======================================
+      # 3. Install dependencies — lockfile-based, reproducible (--frozen-lockfile)
       - name: Install dependencies
-        env:
-          NODE_ENV: development
-        run: pnpm install --frozen-lockfile --prod=false
+        run: pnpm install --frozen-lockfile
 
-      # ======================================
-      # STAGE 6: VERIFY ESLINT
-      # ======================================
-      - name: Verify ESLint installation
-        run: pnpm exec eslint --version
-
-      # ======================================
-      # STAGE 7: RUN ESLINT
-      # ======================================
+      # 4. Run linting
       - name: Run ESLint
-        run: pnpm exec eslint .
+        run: pnpm lint
 
-      # ======================================
-      # STAGE 8: VERIFY TYPESCRIPT
-      # ======================================
-      - name: Verify TypeScript installation
-        run: pnpm exec tsc --version
+      # 5. Run TypeScript checks
+      - name: Generate Payload types + TypeScript check
+        run: |
+          pnpm payload generate:types
+          pnpm typecheck   # script: "tsc --noEmit" — verify it exists in package.json
 
-      # ======================================
-      # STAGE 9: TYPESCRIPT CHECKS
-      # ======================================
-      - name: Run TypeScript checks
-        run: pnpm exec tsc --noEmit
+      # 6. Execute unit tests (Vitest)
+      - name: Run unit tests
+        run: pnpm test:unit -- --reporter=default --reporter=junit --outputFile=test-results/unit.xml
+        # verify script names: test:unit / test:int — adjust to your package.json
 
-      # ======================================
-      # STAGE 10: NEXT.JS PRODUCTION BUILD
-      # ======================================
-      - name: Validate production build
+      # 7. Execute integration tests with PostgreSQL
+      - name: Run integration tests
+        run: pnpm test:int -- --reporter=default --reporter=junit --outputFile=test-results/int.xml
         env:
-          NODE_ENV: production
-          PAYLOAD_SECRET: ci-build-only-secret-not-for-production
-          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
-          NEXT_PUBLIC_SERVER_URL: http://localhost:3002
+          DATABASE_URI: postgresql://payload:payload@localhost:5432/payload_test
 
+      # Publish test reports (also covers step 13 for tests)
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ${{ env.BACKEND_DIR }}/test-results/
+          retention-days: 14
+
+      # 8. Build the application
+      - name: Build application
         run: pnpm build
 
-      # ======================================
-      # STAGE 11: VERIFY BUILD OUTPUT
-      # ======================================
-      - name: Verify standalone build
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: next-build
+          path: ${{ env.BACKEND_DIR }}/.next/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────
+  # 8–10: Docker image + Trivy scan + SBOM
+  # ─────────────────────────────────────────────────────────────
+  docker:
+    name: Docker · Scan · SBOM
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    permissions:
+      contents: read
+      security-events: write # for Trivy SARIF upload
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine image tag
+        id: meta
         run: |
-          set -euo pipefail
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "tag=latest-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=pr-${{ github.event.pull_request.number || 'manual' }}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          fi
 
-          echo "Checking standalone server..."
-          test -f .next/standalone/server.js
+      # 9. Build the Docker image (load locally — push happens only after approval)
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.BACKEND_DIR }}
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=bakery-backend
+          cache-to: type=gha,mode=max,scope=bakery-backend
 
-          echo "Checking static assets..."
-          test -d .next/static
+      # 10. Scan dependencies (lockfile) with Trivy
+      - name: Trivy — dependency scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ env.BACKEND_DIR }}/pnpm-lock.yaml
+          format: sarif
+          output: trivy-deps.sarif
+          severity: CRITICAL,HIGH
 
-          echo "Next.js standalone build verified."
+      # 10b. Scan the built image with Trivy
+      - name: Trivy — image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
 
-      # ======================================
-      # STAGE 12: PUBLISH CI SUMMARY
-      # ======================================
-      - name: Publish CI summary
+      - name: Upload Trivy results to GitHub Security tab
         if: always()
-        env:
-          JOB_RESULT: ${{ job.status }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
 
+      - name: Upload scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            trivy-deps.sarif
+            trivy-image.sarif
+
+      # Fail the pipeline if the IMAGE has fixable CRITICAL vulnerabilities
+      - name: Trivy — gate on critical image vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      # 11. Generate an SBOM (Syft, SPDX format)
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0.17.2
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+      # 11b. Smoke test — start the container and hit an endpoint
+      - name: Smoke test
         run: |
-          {
-            echo "## Sweetcrumb Bakery CI/CD"
-            echo ""
-            echo "| Check | Configuration |"
-            echo "|---|---|"
-            echo "| Node.js | 22 |"
-            echo "| pnpm | 12.11.2 |"
-            echo "| ESLint | 9.x |"
-            echo "| TypeScript | Enabled |"
-            echo "| Next.js | Standalone |"
-            echo "| Backend | bakery-backend |"
-            echo "| Job Result | ${JOB_RESULT} |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          docker run -d --name bakery-smoke \
+            -e PAYLOAD_SECRET=smoke-test-secret \
+            -e DATABASE_URI=postgresql://payload:payload@host.docker.internal:5432/payload \
+            -p 3000:3000 \
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          # Wait for the server to come up (max 60s)
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3000/api/health > /dev/null 2>&1; then
+              echo "Smoke test PASSED"
+              docker logs bakery-smoke
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Smoke test FAILED — container logs:"
+          docker logs bakery-smoke
+          exit 1
+        # NOTE: /api/health must exist — add a Payload health endpoint,
+        # or change the curl URL to an existing route.
+
+  # ─────────────────────────────────────────────────────────────
+  # 11–13: Sign · Push to GHCR · Publish reports
+  # ─────────────────────────────────────────────────────────────
+  publish:
+    name: Sign & Push to GHCR
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.ref == 'refs/heads/main' # only publish from main
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # required for Cosign keyless signing
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 12. Push approved images to GHCR (rebuild with provenance/SBOM attestations)
+      - name: Push image to GHCR
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.BACKEND_DIR }}
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ needs.docker.outputs.image-tag }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha,scope=bakery-backend
+
+      # 13. Sign published images using Cosign (keyless, via GitHub OIDC)
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with Cosign
+        run: |
+          cosign sign --yes \
+            ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+
+      # Attach the SBOM to the pushed image (verifiable via cosign verify-attestation)
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: .
+
+      - name: Attach SBOM attestation
+        run: |
+          cosign attest --yes \
+            --predicate sbom.spdx.json \
+            --type spdx \
+            ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+
+      - name: Verify signature (proves consumers can too)
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+
+  # ─────────────────────────────────────────────────────────────
+  # 13. Publish build & test reports (aggregated summary)
+  # ─────────────────────────────────────────────────────────────
+  publish-reports:
+    name: Publish Reports
+    runs-on: ubuntu-latest
+    needs: [build-and-test, docker, publish]
+    if: always()
+    steps:
+      - name: Download test results
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+          path: reports/tests
+
+      - name: Download security reports
+        uses: actions/download-artifact@v4
+        with:
+          name: security-reports
+          path: reports/security
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: reports/sbom
+
+      - name: Publish consolidated reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-reports
+          path: reports/
+          retention-days: 30
