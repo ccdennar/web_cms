@@ -63,6 +63,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
+          package_json_file: ${{ env.BACKEND_DIR }}/package.json # reads packageManager from here
           run_install: false
 
       - name: Setup Node.js
