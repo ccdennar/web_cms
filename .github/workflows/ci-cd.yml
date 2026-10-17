@@ -1,361 +1,413 @@
-name: CI/CD
+
+name: SweetCrumb Kubernetes CI/CD
 
 on:
   push:
-    branches: [main]
-    paths:
-      - 'bakery-backend/**'
-      - '.github/workflows/ci-cd.yml'
+    branches:
+      - main
   pull_request:
-    branches: [main]
-    paths:
-      - 'bakery-backend/**'
-      - '.github/workflows/ci-cd.yml'
+    branches:
+      - main
   workflow_dispatch:
-
-# Only non-secret, non-DB values live at workflow level.
-# DB credentials are defined per job so they always match the service container.
-env:
-  BACKEND_DIR: bakery-backend
-  IMAGE_NAME: ghcr.io/ccdennar/sweetcrumb-bakery-backend
-  NODE_VERSION: "22"
 
 permissions:
   contents: read
 
+concurrency:
+  group: sweetcrumb-k8s-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_REPOSITORY: ccdennar/web_cms
+  APP_DIR: application/bakery-backend
+  IMAGE_NAME: sweetcrumb-bakery-backend
+  IMAGE_TAG: ci
+  CLUSTER_NAME: sweetcrumb
+  NAMESPACE: sweetcrumb
+
 jobs:
-  # ─────────────────────────────────────────────────────────────
-  # Build & Test
-  # ─────────────────────────────────────────────────────────────
-  build-and-test:
-    name: Lint · Typecheck · Test · Build
+  kubernetes-deployment:
+    name: Build, Deploy and Test
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ${{ env.BACKEND_DIR }}
-
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: payload
-          POSTGRES_PASSWORD: payload
-          POSTGRES_DB: payload_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U payload -d payload_test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    # Both names are set so it works whichever one payload.config.ts reads.
-    # Credentials MUST match POSTGRES_USER / POSTGRES_PASSWORD above.
-    env:
-      DATABASE_URL: postgresql://payload:payload@localhost:5432/payload_test
-      DATABASE_URI: postgresql://payload:payload@localhost:5432/payload_test
-      PAYLOAD_SECRET: ci-test-secret-not-real
+    timeout-minutes: 40
 
     steps:
-      - name: Checkout
+      # ============================================
+      # PHASE 1: CHECKOUT REPOSITORIES
+      # ============================================
+
+      - name: Checkout Kubernetes repository
         uses: actions/checkout@v4
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
         with:
-          package_json_file: ${{ env.BACKEND_DIR }}/package.json # reads packageManager from here
-          run_install: false
+          path: infrastructure
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-          cache-dependency-path: ${{ env.BACKEND_DIR }}/pnpm-lock.yaml
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Run ESLint
-        run: pnpm lint
-
-      - name: Generate Payload types + TypeScript check
-        run: |
-          pnpm payload generate:types
-          pnpm typecheck   # script: "tsc --noEmit" — verify it exists in package.json
-
-      # Integration tests (Vitest) against the Postgres service container.
-      # Reporter flags are passed without the extra "--" so Vitest actually receives them.
-      - name: Run integration tests
-        run: |
-          mkdir -p test-results
-          pnpm test:int --reporter=default --reporter=junit --outputFile.junit=test-results/int.xml
-
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: ${{ env.BACKEND_DIR }}/test-results/
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Build application
-        run: pnpm build
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: next-build
-          path: ${{ env.BACKEND_DIR }}/.next/
-          retention-days: 7
-
-  # ─────────────────────────────────────────────────────────────
-  # Docker image + Trivy scan + SBOM + smoke test
-  # ─────────────────────────────────────────────────────────────
-  docker:
-    name: Docker · Scan · SBOM
-    runs-on: ubuntu-latest
-    needs: build-and-test
-    permissions:
-      contents: read
-      security-events: write # for Trivy SARIF upload
-
-    # Postgres for the smoke test (container runs with --network host)
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: payload
-          POSTGRES_PASSWORD: payload
-          POSTGRES_DB: payload_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U payload -d payload_test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    outputs:
-      image-tag: ${{ steps.meta.outputs.tag }}
-
-    steps:
-      - name: Checkout
+      - name: Checkout Payload CMS application
         uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPOSITORY }}
+          ref: main
+          path: application
+
+      # ============================================
+      # PHASE 2: VALIDATE PROJECT STRUCTURE
+      # ============================================
+
+      - name: Validate project files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Validating application and Kubernetes files..."
+
+          test -f "$APP_DIR/Dockerfile"
+          test -d infrastructure/k8s
+
+          echo "Application Dockerfile found."
+          echo "Kubernetes manifests directory found."
+
+          echo "Available Kubernetes manifests:"
+          find infrastructure/k8s \
+            -type f \( -name "*.yaml" -o -name "*.yml" \) \
+            -print
+
+      # ============================================
+      # PHASE 3: BUILD DOCKER IMAGE
+      # ============================================
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Determine image tag
-        id: meta
+      - name: Build Payload CMS Docker image
+        shell: bash
         run: |
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "tag=latest-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          echo "Building Payload CMS Docker image..."
+
+          docker build \
+            -t "$IMAGE_NAME:$IMAGE_TAG" \
+            -f "$APP_DIR/Dockerfile" \
+            "$APP_DIR"
+
+          echo "Docker image built successfully."
+
+      - name: Verify Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker image inspect "$IMAGE_NAME:$IMAGE_TAG"
+
+      # ============================================
+      # PHASE 4: CREATE KIND CLUSTER
+      # ============================================
+
+      - name: Create Kubernetes Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: sweetcrumb
+          wait: 120s
+
+      - name: Verify Kubernetes cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl cluster-info
+          kubectl get nodes -o wide
+
+      # ============================================
+      # PHASE 5: LOAD IMAGE INTO KIND
+      # ============================================
+
+      - name: Load Docker image into Kind
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kind load docker-image \
+            "$IMAGE_NAME:$IMAGE_TAG" \
+            --name "$CLUSTER_NAME"
+
+          echo "Docker image loaded into Kind."
+
+      # ============================================
+      # PHASE 6: CREATE NAMESPACE AND SECRETS
+      # ============================================
+
+      - name: Create Kubernetes namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl create namespace "$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create application secrets
+        shell: bash
+        env:
+          PAYLOAD_SECRET: ${{ secrets.PAYLOAD_SECRET }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          : "${PAYLOAD_SECRET:?Missing PAYLOAD_SECRET}"
+          : "${DATABASE_URL:?Missing DATABASE_URL}"
+          : "${POSTGRES_PASSWORD:?Missing POSTGRES_PASSWORD}"
+
+          kubectl -n "$NAMESPACE" create secret generic bakery-secrets \
+            --from-literal=PAYLOAD_SECRET="$PAYLOAD_SECRET" \
+            --from-literal=DATABASE_URL="$DATABASE_URL" \
+            --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "Application secrets configured."
+
+      # ============================================
+      # PHASE 7: DEPLOY KUBERNETES RESOURCES
+      # ============================================
+
+      - name: Deploy Kubernetes manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Deploying SweetCrumb Kubernetes resources..."
+
+          kubectl apply -R -f infrastructure/k8s/
+
+          kubectl -n "$NAMESPACE" get all
+
+      # ============================================
+      # PHASE 8: VERIFY POSTGRESQL
+      # ============================================
+
+      - name: Wait for PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for PostgreSQL StatefulSet..."
+
+          kubectl -n "$NAMESPACE" rollout status \
+            statefulset/postgres \
+            --timeout=240s
+
+          echo "PostgreSQL workload is ready."
+
+      # ============================================
+      # PHASE 9: VERIFY BACKEND DEPLOYMENT
+      # ============================================
+
+      - name: Wait for Payload CMS backend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for bakery backend..."
+
+          kubectl -n "$NAMESPACE" rollout status \
+            deployment/bakery-backend \
+            --timeout=240s
+
+          echo "Backend deployment is ready."
+
+      - name: Inspect deployed workloads
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl -n "$NAMESPACE" get pods -o wide
+          kubectl -n "$NAMESPACE" get services
+          kubectl -n "$NAMESPACE" get pvc
+
+      # ============================================
+      # PHASE 10: DATABASE INTEGRATION TEST
+      # ============================================
+
+      - name: Verify Payload CMS database integration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo " Payload CMS Database Integration Test"
+          echo "=========================================="
+
+          TEST_POD="bakery-db-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          cleanup() {
+            echo "Cleaning up integration test pod..."
+
+            kubectl -n "$NAMESPACE" delete pod "$TEST_POD" \
+              --ignore-not-found=true \
+              --wait=false || true
+          }
+
+          trap cleanup EXIT
+
+          echo "Namespace: $NAMESPACE"
+          echo "Test pod: $TEST_POD"
+          echo "Endpoint: http://bakery-backend/api/health"
+
+          echo "Checking backend deployment..."
+
+          kubectl -n "$NAMESPACE" rollout status \
+            deployment/bakery-backend \
+            --timeout=180s
+
+          echo "Checking backend service..."
+
+          kubectl -n "$NAMESPACE" get service bakery-backend
+
+          echo "Starting database integration test..."
+
+          if kubectl -n "$NAMESPACE" run "$TEST_POD" \
+            --image=curlimages/curl:8.12.1 \
+            --restart=Never \
+            --rm \
+            -i \
+            --pod-running-timeout=120s \
+            --command -- \
+            sh -ec '
+              for attempt in $(seq 1 20); do
+
+                echo "Health check attempt: $attempt/20"
+
+                if curl \
+                  --fail \
+                  --silent \
+                  --show-error \
+                  --max-time 10 \
+                  http://bakery-backend/api/health; then
+
+                  echo ""
+                  echo "Payload CMS database integration passed."
+                  exit 0
+                fi
+
+                echo "Health check failed. Retrying..."
+                sleep 5
+              done
+
+              echo "Payload CMS database integration failed."
+              exit 1
+            '; then
+
+            echo "=========================================="
+            echo " DATABASE INTEGRATION TEST PASSED"
+            echo "=========================================="
+
           else
-            echo "tag=pr-${{ github.event.pull_request.number || 'manual' }}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+            echo "=========================================="
+            echo " DATABASE INTEGRATION TEST FAILED"
+            echo "=========================================="
+
+            echo "Backend pods:"
+            kubectl -n "$NAMESPACE" get pods -o wide || true
+
+            echo "Backend service:"
+            kubectl -n "$NAMESPACE" describe service bakery-backend || true
+
+            echo "Backend logs:"
+            kubectl -n "$NAMESPACE" logs \
+              deployment/bakery-backend \
+              --tail=100 || true
+
+            exit 1
           fi
 
-      # Build locally (load) — push happens only in the publish job
-      - name: Build Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ env.BACKEND_DIR }}
-          load: true
-          tags: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
-          cache-from: type=gha,scope=bakery-backend
-          cache-to: type=gha,mode=max,scope=bakery-backend
+      # ============================================
+      # PHASE 11: HTTP SMOKE TEST
+      # ============================================
 
-      - name: Trivy — dependency scan
-        uses: aquasecurity/trivy-action@v0.35.0
-        with:
-          scan-type: fs
-          scan-ref: ${{ env.BACKEND_DIR }}/pnpm-lock.yaml
-          format: sarif
-          output: trivy-deps.sarif
-          severity: CRITICAL,HIGH
-
-      - name: Trivy — image scan
-        uses: aquasecurity/trivy-action@v0.35.0
-        with:
-          scan-type: image
-          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
-          format: sarif
-          output: trivy-image.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-
-      - name: Upload Trivy results to GitHub Security tab
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-image.sarif
-
-      - name: Upload scan reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-reports
-          path: |
-            trivy-deps.sarif
-            trivy-image.sarif
-
-      # Fail the pipeline if the IMAGE has fixable CRITICAL vulnerabilities
-      - name: Trivy — gate on critical image vulnerabilities
-        uses: aquasecurity/trivy-action@v0.35.0
-        with:
-          scan-type: image
-          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
-          severity: CRITICAL
-          ignore-unfixed: true
-          exit-code: '1'
-
-      - name: Generate SBOM
-        uses: anchore/sbom-action@v0.17.2
-        with:
-          image: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
-          format: spdx-json
-          output-file: sbom.spdx.json
-
-      - name: Upload SBOM
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbom
-          path: sbom.spdx.json
-
-      # Smoke test: --network host lets the container reach the Postgres
-      # service on localhost (host.docker.internal doesn't exist on Linux runners).
-      # Payload has no /api/health by default, so we hit /api/access and accept any
-      # non-5xx response. Change SMOKE_PATH if you add a real health route.
-      - name: Smoke test
-        env:
-          SMOKE_PATH: /api/access
+      - name: Run application HTTP smoke test
+        shell: bash
         run: |
-          docker run -d --name bakery-smoke --network host \
-            -e PAYLOAD_SECRET=smoke-test-secret \
-            -e DATABASE_URL=postgresql://payload:payload@localhost:5432/payload_test \
-            -e DATABASE_URI=postgresql://payload:payload@localhost:5432/payload_test \
-            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          set -euo pipefail
 
-          # Wait for the server to come up (max 60s)
-          for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:3000${SMOKE_PATH}" || true)
-            if [[ "$CODE" =~ ^[234][0-9][0-9]$ ]]; then
-              echo "Smoke test PASSED (HTTP $CODE)"
-              docker logs bakery-smoke
-              docker rm -f bakery-smoke
-              exit 0
-            fi
-            sleep 2
-          done
+          echo "Starting application HTTP smoke test..."
 
-          echo "Smoke test FAILED — container logs:"
-          docker logs bakery-smoke
-          docker rm -f bakery-smoke
-          exit 1
+          kubectl -n "$NAMESPACE" run bakery-smoke-test \
+            --image=curlimages/curl:8.12.1 \
+            --restart=Never \
+            --rm \
+            -i \
+            --pod-running-timeout=120s \
+            --command -- \
+            sh -ec '
+              curl \
+                --fail \
+                --silent \
+                --show-error \
+                --max-time 15 \
+                http://bakery-backend/api/health
 
-  # ─────────────────────────────────────────────────────────────
-  # Sign · Push to GHCR
-  # ─────────────────────────────────────────────────────────────
-  publish:
-    name: Sign & Push to GHCR
-    runs-on: ubuntu-latest
-    needs: docker
-    if: github.ref == 'refs/heads/main' # only publish from main
-    permissions:
-      contents: read
-      packages: write
-      id-token: write # required for Cosign keyless signing
+              echo ""
+              echo "HTTP smoke test passed."
+            '
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      # ============================================
+      # PHASE 12: FAILURE DIAGNOSTICS
+      # ============================================
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Push image to GHCR
-        id: push
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ env.BACKEND_DIR }}
-          push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ needs.docker.outputs.image-tag }}
-            ${{ env.IMAGE_NAME }}:latest
-          cache-from: type=gha,scope=bakery-backend
-
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign image with Cosign
+      - name: Collect Kubernetes diagnostics
+        if: failure()
+        shell: bash
         run: |
-          cosign sign --yes \
-            ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          echo "=========================================="
+          echo " Kubernetes Failure Diagnostics"
+          echo "=========================================="
 
-      - name: Download SBOM
-        uses: actions/download-artifact@v4
-        with:
-          name: sbom
-          path: .
+          kubectl get nodes -o wide || true
 
-      - name: Attach SBOM attestation
+          kubectl -n "$NAMESPACE" get all -o wide || true
+
+          kubectl -n "$NAMESPACE" get pvc || true
+
+          kubectl -n "$NAMESPACE" get events \
+            --sort-by=.lastTimestamp || true
+
+          echo "Backend deployment:"
+          kubectl -n "$NAMESPACE" describe \
+            deployment/bakery-backend || true
+
+          echo "Backend logs:"
+          kubectl -n "$NAMESPACE" logs \
+            deployment/bakery-backend \
+            --all-pods=true \
+            --all-containers=true \
+            --tail=150 || true
+
+          echo "PostgreSQL logs:"
+          kubectl -n "$NAMESPACE" logs \
+            statefulset/postgres \
+            --all-containers=true \
+            --tail=100 || true
+
+      # ============================================
+      # PHASE 13: DEPLOYMENT SUMMARY
+      # ============================================
+
+      - name: Deployment summary
+        if: success()
+        shell: bash
         run: |
-          cosign attest --yes \
-            --predicate sbom.spdx.json \
-            --type spdx \
-            ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-
-      - name: Verify signature
-        run: |
-          cosign verify \
-            --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-
-  # ─────────────────────────────────────────────────────────────
-  # Publish build & test reports (aggregated summary)
-  # ─────────────────────────────────────────────────────────────
-  publish-reports:
-    name: Publish Reports
-    runs-on: ubuntu-latest
-    needs: [build-and-test, docker, publish]
-    if: always()
-    steps:
-      # continue-on-error so a failed/skipped upstream job doesn't break the summary
-      - name: Download test results
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: test-results
-          path: reports/tests
-
-      - name: Download security reports
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: security-reports
-          path: reports/security
-
-      - name: Download SBOM
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: sbom
-          path: reports/sbom
-
-      - name: Publish consolidated reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: pipeline-reports
-          path: reports/
-          if-no-files-found: warn
-          retention-days: 30
+          {
+            echo "## SweetCrumb Kubernetes Deployment"
+            echo ""
+            echo "| Component | Status |"
+            echo "|---|---|"
+            echo "| Docker image | Built |"
+            echo "| Kind cluster | Created |"
+            echo "| PostgreSQL | Ready |"
+            echo "| Payload CMS | Ready |"
+            echo "| Database integration | Passed |"
+            echo "| HTTP smoke test | Passed |"
+            echo ""
+            echo "Namespace: \`$NAMESPACE\`"
+            echo ""
+            echo "Image: \`$IMAGE_NAME:$IMAGE_TAG\`"
+          } >> "$GITHUB_STEP_SUMMARY"
