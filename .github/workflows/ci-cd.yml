@@ -222,6 +222,37 @@ jobs:
           kubectl -n "$NAMESPACE" get services
           kubectl -n "$NAMESPACE" get pvc
 
+        
+      - name: Debug backend health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking Kubernetes workloads..."
+          kubectl -n "$NAMESPACE" get pods -o wide
+          kubectl -n "$NAMESPACE" get svc
+          kubectl -n "$NAMESPACE" get endpoints bakery-backend
+
+          echo "Checking deployed container images..."
+          kubectl -n "$NAMESPACE" get deployment bakery-backend \
+            -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{" => "}{.image}{"\n"}{end}'
+
+          echo "Checking backend logs..."
+          kubectl -n "$NAMESPACE" logs \
+            deployment/bakery-backend \
+            --tail=100
+
+          echo "Checking HTTP endpoint..."
+          kubectl -n "$NAMESPACE" run health-debug \
+            --image=curlimages/curl:8.12.1 \
+            --restart=Never \
+            --rm \
+            -i \
+            --command -- \
+            curl -i --max-time 15 \
+            http://bakery-backend/api/health
+
+
       # ============================================
       # PHASE 10: DATABASE INTEGRATION TEST
       # ============================================
