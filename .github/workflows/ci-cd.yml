@@ -13,19 +13,20 @@ on:
       - '.github/workflows/ci-cd.yml'
   workflow_dispatch:
 
-# Only non-secret, non-DB values live at workflow level.
-# DB credentials are defined per job so they always match the service container.
 env:
   BACKEND_DIR: bakery-backend
   IMAGE_NAME: ghcr.io/ccdennar/sweetcrumb-bakery-backend
   NODE_VERSION: "22"
+
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/payload_test
+  PAYLOAD_SECRET: ${PAYLOAD_SECRET}
 
 permissions:
   contents: read
 
 jobs:
   # ─────────────────────────────────────────────────────────────
-  # Build & Test
+  # 1–7: Build & Test
   # ─────────────────────────────────────────────────────────────
   build-and-test:
     name: Lint · Typecheck · Test · Build
@@ -49,17 +50,16 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
-    # Both names are set so it works whichever one payload.config.ts reads.
-    # Credentials MUST match POSTGRES_USER / POSTGRES_PASSWORD above.
     env:
-      DATABASE_URL: postgresql://payload:payload@localhost:5432/payload_test
       DATABASE_URI: postgresql://payload:payload@localhost:5432/payload_test
       PAYLOAD_SECRET: ci-test-secret-not-real
 
     steps:
+      # 1. Checkout source code
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 2. Configure Node.js (+ pnpm)
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -73,33 +73,40 @@ jobs:
           cache: pnpm
           cache-dependency-path: ${{ env.BACKEND_DIR }}/pnpm-lock.yaml
 
+      # 3. Install dependencies — lockfile-based, reproducible (--frozen-lockfile)
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # 4. Run linting
       - name: Run ESLint
         run: pnpm lint
 
+      # 5. Run TypeScript checks
       - name: Generate Payload types + TypeScript check
         run: |
           pnpm payload generate:types
           pnpm typecheck   # script: "tsc --noEmit" — verify it exists in package.json
 
-      # Integration tests (Vitest) against the Postgres service container.
-      # Reporter flags are passed without the extra "--" so Vitest actually receives them.
-      - name: Run integration tests
-        run: |
-          mkdir -p test-results
-          pnpm test:int --reporter=default --reporter=junit --outputFile.junit=test-results/int.xml
+      # 6. Execute unit tests (Vitest)
+      - name: Run unit tests
+        run: pnpm test:int -- --reporter=default --reporter=junit --outputFile=test-results/unit.xml
 
+      # 7. Execute integration tests with PostgreSQL
+      - name: Run integration tests
+        run: pnpm test:int -- --reporter=default --reporter=junit --outputFile=test-results/int.xml
+        env:
+          DATABASE_URI: postgresql://payload:payload@localhost:5432/payload_test
+
+      # Publish test reports (also covers step 13 for tests)
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results
           path: ${{ env.BACKEND_DIR }}/test-results/
-          if-no-files-found: warn
           retention-days: 14
 
+      # 8. Build the application
       - name: Build application
         run: pnpm build
 
@@ -111,7 +118,7 @@ jobs:
           retention-days: 7
 
   # ─────────────────────────────────────────────────────────────
-  # Docker image + Trivy scan + SBOM + smoke test
+  # 8–10: Docker image + Trivy scan + SBOM
   # ─────────────────────────────────────────────────────────────
   docker:
     name: Docker · Scan · SBOM
@@ -120,22 +127,6 @@ jobs:
     permissions:
       contents: read
       security-events: write # for Trivy SARIF upload
-
-    # Postgres for the smoke test (container runs with --network host)
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: payload
-          POSTGRES_PASSWORD: payload
-          POSTGRES_DB: payload_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U payload -d payload_test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
 
     outputs:
       image-tag: ${{ steps.meta.outputs.tag }}
@@ -150,14 +141,14 @@ jobs:
       - name: Determine image tag
         id: meta
         run: |
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             echo "tag=latest-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           else
             echo "tag=pr-${{ github.event.pull_request.number || 'manual' }}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
-      # Build locally (load) — push happens only in the publish job
+      # 9. Build the Docker image (load locally — push happens only after approval)
       - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
@@ -167,6 +158,7 @@ jobs:
           cache-from: type=gha,scope=bakery-backend
           cache-to: type=gha,mode=max,scope=bakery-backend
 
+      # 10. Scan dependencies (lockfile) with Trivy
       - name: Trivy — dependency scan
         uses: aquasecurity/trivy-action@0.28.0
         with:
@@ -176,6 +168,7 @@ jobs:
           output: trivy-deps.sarif
           severity: CRITICAL,HIGH
 
+      # 10b. Scan the built image with Trivy
       - name: Trivy — image scan
         uses: aquasecurity/trivy-action@0.28.0
         with:
@@ -211,6 +204,7 @@ jobs:
           ignore-unfixed: true
           exit-code: '1'
 
+      # 11. Generate an SBOM (Syft, SPDX format)
       - name: Generate SBOM
         uses: anchore/sbom-action@v0.17.2
         with:
@@ -224,39 +218,31 @@ jobs:
           name: sbom
           path: sbom.spdx.json
 
-      # Smoke test: --network host lets the container reach the Postgres
-      # service on localhost (host.docker.internal doesn't exist on Linux runners).
-      # Payload has no /api/health by default, so we hit /api/access and accept any
-      # non-5xx response. Change SMOKE_PATH if you add a real health route.
+      # 11b. Smoke test — start the container and hit an endpoint
       - name: Smoke test
-        env:
-          SMOKE_PATH: /api/access
         run: |
-          docker run -d --name bakery-smoke --network host \
+          docker run -d --name bakery-smoke \
             -e PAYLOAD_SECRET=smoke-test-secret \
-            -e DATABASE_URL=postgresql://payload:payload@localhost:5432/payload_test \
-            -e DATABASE_URI=postgresql://payload:payload@localhost:5432/payload_test \
+            -e DATABASE_URI=postgresql://payload:payload@host.docker.internal:5432/payload \
+            -p 3000:3000 \
             ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
-
           # Wait for the server to come up (max 60s)
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:3000${SMOKE_PATH}" || true)
-            if [[ "$CODE" =~ ^[234][0-9][0-9]$ ]]; then
-              echo "Smoke test PASSED (HTTP $CODE)"
+            if curl -fsS http://localhost:3000/api/health > /dev/null 2>&1; then
+              echo "Smoke test PASSED"
               docker logs bakery-smoke
-              docker rm -f bakery-smoke
               exit 0
             fi
             sleep 2
           done
-
           echo "Smoke test FAILED — container logs:"
           docker logs bakery-smoke
-          docker rm -f bakery-smoke
           exit 1
+        # NOTE: /api/health must exist — add a Payload health endpoint,
+        # or change the curl URL to an existing route.
 
   # ─────────────────────────────────────────────────────────────
-  # Sign · Push to GHCR
+  # 11–13: Sign · Push to GHCR · Publish reports
   # ─────────────────────────────────────────────────────────────
   publish:
     name: Sign & Push to GHCR
@@ -282,6 +268,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 12. Push approved images to GHCR (rebuild with provenance/SBOM attestations)
       - name: Push image to GHCR
         id: push
         uses: docker/build-push-action@v6
@@ -293,6 +280,7 @@ jobs:
             ${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha,scope=bakery-backend
 
+      # 13. Sign published images using Cosign (keyless, via GitHub OIDC)
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
 
@@ -301,6 +289,7 @@ jobs:
           cosign sign --yes \
             ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
+      # Attach the SBOM to the pushed image (verifiable via cosign verify-attestation)
       - name: Download SBOM
         uses: actions/download-artifact@v4
         with:
@@ -314,7 +303,7 @@ jobs:
             --type spdx \
             ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
-      - name: Verify signature
+      - name: Verify signature (proves consumers can too)
         run: |
           cosign verify \
             --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
@@ -322,7 +311,7 @@ jobs:
             ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
   # ─────────────────────────────────────────────────────────────
-  # Publish build & test reports (aggregated summary)
+  # 13. Publish build & test reports (aggregated summary)
   # ─────────────────────────────────────────────────────────────
   publish-reports:
     name: Publish Reports
@@ -330,24 +319,20 @@ jobs:
     needs: [build-and-test, docker, publish]
     if: always()
     steps:
-      # continue-on-error so a failed/skipped upstream job doesn't break the summary
       - name: Download test results
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: test-results
           path: reports/tests
 
       - name: Download security reports
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: security-reports
           path: reports/security
 
       - name: Download SBOM
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: sbom
           path: reports/sbom
@@ -357,5 +342,4 @@ jobs:
         with:
           name: pipeline-reports
           path: reports/
-          if-no-files-found: warn
           retention-days: 30
