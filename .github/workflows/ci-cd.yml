@@ -289,6 +289,41 @@ jobs:
           cosign sign --yes \
             ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
+    
+      - name: Diagnose PostgreSQL and Payload CMS
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========== KUBERNETES PODS =========="
+          kubectl -n "$NAMESPACE" get pods -o wide
+
+          echo "========== SERVICES =========="
+          kubectl -n "$NAMESPACE" get services
+
+          echo "========== POSTGRESQL STATUS =========="
+          kubectl -n "$NAMESPACE" get statefulsets
+
+          echo "========== POSTGRESQL LOGS =========="
+          kubectl -n "$NAMESPACE" logs \
+            statefulset/postgres \
+            --tail=100 || true
+
+          echo "========== PAYLOAD CMS LOGS =========="
+          kubectl -n "$NAMESPACE" logs \
+            deployment/bakery-backend \
+            --tail=150 || true
+
+          echo "========== DATABASE SERVICE =========="
+          kubectl -n "$NAMESPACE" get endpoints postgres || true
+
+          echo "========== BACKEND ENV VARIABLE NAMES =========="
+          kubectl -n "$NAMESPACE" exec \
+            deployment/bakery-backend -- \
+            sh -c 'env | cut -d= -f1 | sort' || true
+
+
       # Attach the SBOM to the pushed image (verifiable via cosign verify-attestation)
       - name: Download SBOM
         uses: actions/download-artifact@v4
