@@ -51,6 +51,7 @@ jobs:
           --health-retries 5
 
     env:
+      DATABASE_URL: postgresql://payload:payload@localhost:5432/payload_test
       DATABASE_URI: postgresql://payload:payload@localhost:5432/payload_test
       PAYLOAD_SECRET: ci-test-secret-not-real
 
@@ -223,6 +224,7 @@ jobs:
         run: |
           docker run -d --name bakery-smoke \
             -e PAYLOAD_SECRET=smoke-test-secret \
+            -e DATABASE_URI=postgresql://payload:payload@host.docker.internal:5432/payload \
             -e DATABASE_URI=postgresql://payload:payload@host.docker.internal:5432/payload \
             -p 3000:3000 \
             ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
