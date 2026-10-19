@@ -326,39 +326,43 @@ jobs:
             ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
     
-      - name: Diagnose PostgreSQL and Payload CMS
+      - name: Diagnose Kubernetes and Payload CMS
         if: always()
+        env:
+          NAMESPACE: sweetcrumb
         shell: bash
         run: |
-          set -euo pipefail
+          echo "========== CLUSTER INFO =========="
+          # Check if kubectl can actually connect to a cluster
+          if ! kubectl cluster-info > /dev/null 2>&1; then
+            echo "⚠️ WARNING: No Kubernetes cluster is accessible in this job."
+            echo "💡 TIP: Ensure this step is in the 'kubernetes-deployment' job AFTER 'Create Kind cluster'."
+            exit 0
+          fi
 
           echo "========== KUBERNETES PODS =========="
-          kubectl -n "$NAMESPACE" get pods -o wide
-
+          kubectl -n "$NAMESPACE" get pods -o wide || true
+          
           echo "========== SERVICES =========="
-          kubectl -n "$NAMESPACE" get services
-
+          kubectl -n "$NAMESPACE" get services || true
+          
           echo "========== POSTGRESQL STATUS =========="
-          kubectl -n "$NAMESPACE" get statefulsets
-
+          kubectl -n "$NAMESPACE" get statefulsets || true
+          kubectl -n "$NAMESPACE" get deployments || true
+          
           echo "========== POSTGRESQL LOGS =========="
-          kubectl -n "$NAMESPACE" logs \
-            statefulset/postgres \
-            --tail=100 || true
-
+          kubectl -n "$NAMESPACE" logs statefulset/postgres --tail=100 || true
+          kubectl -n "$NAMESPACE" logs deployment/postgres --tail=100 || true
+          
           echo "========== PAYLOAD CMS LOGS =========="
-          kubectl -n "$NAMESPACE" logs \
-            deployment/bakery-backend \
-            --tail=150 || true
-
+          kubectl -n "$NAMESPACE" logs deployment/bakery-backend --tail=150 || true
+          
           echo "========== DATABASE SERVICE =========="
           kubectl -n "$NAMESPACE" get endpoints postgres || true
-
+          kubectl -n "$NAMESPACE" get svc postgres || true
+          
           echo "========== BACKEND ENV VARIABLE NAMES =========="
-          kubectl -n "$NAMESPACE" exec \
-            deployment/bakery-backend -- \
-            sh -c 'env | cut -d= -f1 | sort' || true
-
+          kubectl -n "$NAMESPACE" exec deployment/bakery-backend -- sh -c 'env | grep -E "DATABASE|PAYLOAD" | sort' || true
 
       # Attach the SBOM to the pushed image (verifiable via cosign verify-attestation)
       - name: Download SBOM
