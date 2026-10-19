@@ -215,27 +215,36 @@ jobs:
         with:
           name: sbom
           path: sbom.spdx.json
-
-      # 11b. Smoke test — start the container and hit an endpoint
+      
+    # 11b. Smoke test — start the container and hit an endpoint
       - name: Smoke test
         run: |
+          echo "🚀 Starting smoke test container..."
+          
+          # Use --network host so the container can reach the 'postgres' service on localhost
           docker run -d --name bakery-smoke \
+            --network host \
             -e PAYLOAD_SECRET=smoke-test-secret \
-            -e DATABASE_URI=postgresql://payload:payload@host.docker.internal:5432/payload \
-            -e DATABASE_URI=postgresql://payload:payload@host.docker.internal:5432/payload \
-            -p 3000:3000 \
+            -e DATABASE_URL=postgresql://payload:payload@localhost:5432/payload_test \
+            -e DATABASE_URI=postgresql://payload:payload@localhost:5432/payload_test \
             ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
-          # Wait for the server to come up (max 60s)
+          
+          echo "⏳ Waiting for the server to come up (max 60s)..."
           for i in $(seq 1 30); do
-            if curl -fsS http://localhost:3000/api/health > /dev/null 2>&1; then
-              echo "Smoke test PASSED"
+            # Payload CMS root endpoint is the most reliable health check
+            if curl -fsS http://localhost:3000/ > /dev/null 2>&1; then
+              echo "✅ Smoke test PASSED"
               docker logs bakery-smoke
+              docker rm -f bakery-smoke
               exit 0
             fi
+            echo "Waiting... (attempt $i/30)"
             sleep 2
           done
-          echo "Smoke test FAILED — container logs:"
+          
+          echo "❌ Smoke test FAILED — container logs:"
           docker logs bakery-smoke
+          docker rm -f bakery-smoke
           exit 1
         # NOTE: /api/health must exist — add a Payload health endpoint,
         # or change the curl URL to an existing route.
