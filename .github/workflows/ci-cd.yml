@@ -20,6 +20,7 @@ env:
 
   DATABASE_URL: postgresql://postgres:postgres@localhost:5432/payload_test
   PAYLOAD_SECRET: ${PAYLOAD_SECRET}
+  NAMESPACE: sweetcrumb
 
 permissions:
   contents: read
@@ -54,6 +55,7 @@ jobs:
       DATABASE_URL: postgresql://payload:payload@localhost:5432/payload_test
       DATABASE_URI: postgresql://payload:payload@localhost:5432/payload_test
       PAYLOAD_SECRET: ci-test-secret-not-real
+      NAMESPACE: sweetcrumb
 
     steps:
       # 1. Checkout source code
