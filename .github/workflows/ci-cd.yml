@@ -159,29 +159,26 @@ jobs:
           cache-from: type=gha,scope=bakery-backend
           cache-to: type=gha,mode=max,scope=bakery-backend
 
-            # 10. Scan dependencies (lockfile) with Trivy
+                  # 10. Scan dependencies (lockfile) with Trivy (Docker Native)
       - name: Trivy — dependency scan
-        uses: aquasecurity/trivy-action@v0.29.0  # ✅ Downgraded to stable v0.29.0
-        with:
-          scan-type: fs
-          scan-ref: ${{ env.BACKEND_DIR }}/pnpm-lock.yaml
-          format: sarif
-          output: trivy-deps.sarif
-          severity: CRITICAL,HIGH
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/${{ env.BACKEND_DIR }}:/workspace \
+            -v /tmp/trivy-cache:/root/.cache/ \
+            aquasec/trivy:0.58.0 \
+            fs /workspace --format sarif --output /workspace/trivy-deps.sarif --severity CRITICAL,HIGH
+        working-directory: ${{ github.workspace }}
 
-      # 10b. Scan the built image with Trivy
+      # 10b. Scan the built image with Trivy (Docker Native)
       - name: Trivy — image scan
-        uses: aquasecurity/trivy-action@v0.29.0  # ✅ Downgraded to stable v0.29.0
-        with:
-          scan-type: image
-          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
-          format: sarif
-          output: trivy-image.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /tmp/trivy-cache:/root/.cache/ \
+            aquasec/trivy:0.58.0 \
+            image --format sarif --output trivy-image.sarif --severity CRITICAL,HIGH --ignore-unfixed ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
 
       - name: Upload Trivy results to GitHub Security tab
-        # ✅ Only run if the file was actually created, and upgrade to v4
         if: always() && hashFiles('trivy-image.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
         with:
@@ -193,19 +190,18 @@ jobs:
         with:
           name: security-reports
           path: |
-            trivy-deps.sarif
+            ${{ env.BACKEND_DIR }}/trivy-deps.sarif
             trivy-image.sarif
-          if-no-files-found: warn  # ✅ Prevents artifact step from failing if scans failed
+          if-no-files-found: warn
 
       # Fail the pipeline if the IMAGE has fixable CRITICAL vulnerabilities
       - name: Trivy — gate on critical image vulnerabilities
-        uses: aquasecurity/trivy-action@v0.29.0  # ✅ Downgraded to stable v0.29.0
-        with:
-          scan-type: image
-          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
-          severity: CRITICAL
-          ignore-unfixed: true
-          exit-code: '1'
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /tmp/trivy-cache:/root/.cache/ \
+            aquasec/trivy:0.58.0 \
+            image --severity CRITICAL --ignore-unfixed --exit-code 1 ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
       # 11. Generate an SBOM (Syft, SPDX format)
       - name: Generate SBOM
         uses: anchore/sbom-action@v0.17.2
