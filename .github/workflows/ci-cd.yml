@@ -216,12 +216,32 @@ jobs:
           name: sbom
           path: sbom.spdx.json
       
-    # 11b. Smoke test — start the container and hit an endpoint
+          # 11b. Smoke test — start DB and app, then hit an endpoint
       - name: Smoke test
         run: |
-          echo "🚀 Starting smoke test container..."
+          set -euo pipefail
+          echo "🚀 Starting PostgreSQL service for smoke test..."
           
-          # Use --network host so the container can reach the 'postgres' service on localhost
+          # 1. Start a dedicated Postgres container for this test
+          docker run -d --name smoke-postgres \
+            -e POSTGRES_USER=payload \
+            -e POSTGRES_PASSWORD=payload \
+            -e POSTGRES_DB=payload_test \
+            -p 5432:5432 \
+            postgres:16-alpine
+          
+          echo "⏳ Waiting for PostgreSQL to be ready..."
+          for i in $(seq 1 15); do
+            if docker exec smoke-postgres pg_isready -U payload -d payload_test > /dev/null 2>&1; then
+              echo "✅ PostgreSQL is ready"
+              break
+            fi
+            echo "Waiting for PostgreSQL... ($i/15)"
+            sleep 2
+          done
+
+          echo "🚀 Starting application container..."
+          # 2. Start the app with --network host so it can reach localhost:5432
           docker run -d --name bakery-smoke \
             --network host \
             -e PAYLOAD_SECRET=smoke-test-secret \
@@ -236,15 +256,21 @@ jobs:
               echo "✅ Smoke test PASSED"
               docker logs bakery-smoke
               docker rm -f bakery-smoke
+              docker rm -f smoke-postgres
               exit 0
             fi
-            echo "Waiting... (attempt $i/30)"
+            echo "Waiting for application... (attempt $i/30)"
             sleep 2
           done
           
           echo "❌ Smoke test FAILED — container logs:"
+          echo "--- Bakery Backend Logs ---"
           docker logs bakery-smoke
+          echo "--- PostgreSQL Logs ---"
+          docker logs smoke-postgres
+          
           docker rm -f bakery-smoke
+          docker rm -f smoke-postgres
           exit 1
         # NOTE: /api/health must exist — add a Payload health endpoint,
         # or change the curl URL to an existing route.
