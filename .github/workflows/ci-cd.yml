@@ -17,17 +17,19 @@ env:
   BACKEND_DIR: bakery-backend
   IMAGE_NAME: ghcr.io/ccdennar/sweetcrumb-bakery-backend
   NODE_VERSION: "22"
-
-  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/payload_test
-  PAYLOAD_SECRET: ${PAYLOAD_SECRET}
-  NAMESPACE: sweetcrumb
+  # ✅ FIX: Global default matches the postgres service container credentials
+  DATABASE_URL: postgresql://payload:payload@localhost:5432/payload_test
+  PAYLOAD_SECRET: ci-test-secret-not-real
 
 permissions:
   contents: read
+  packages: write
+  security-events: write
+  id-token: write
 
 jobs:
   # ─────────────────────────────────────────────────────────────
-  # 1–7: Build & Test
+  # 1. BUILD & TEST
   # ─────────────────────────────────────────────────────────────
   build-and-test:
     name: Lint · Typecheck · Test · Build
@@ -51,22 +53,20 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+    # ✅ FIX: Explicitly set BOTH variables to match the service container
     env:
       DATABASE_URL: postgresql://payload:payload@localhost:5432/payload_test
       DATABASE_URI: postgresql://payload:payload@localhost:5432/payload_test
       PAYLOAD_SECRET: ci-test-secret-not-real
-      NAMESPACE: sweetcrumb
 
     steps:
-      # 1. Checkout source code
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. Configure Node.js (+ pnpm)
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10 # must match packageManager in package.json
+          version: 10
           run_install: false
 
       - name: Setup Node.js
@@ -76,40 +76,29 @@ jobs:
           cache: pnpm
           cache-dependency-path: ${{ env.BACKEND_DIR }}/pnpm-lock.yaml
 
-      # 3. Install dependencies — lockfile-based, reproducible (--frozen-lockfile)
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # 4. Run linting
       - name: Run ESLint
         run: pnpm lint
 
-      # 5. Run TypeScript checks
       - name: Generate Payload types + TypeScript check
         run: |
           pnpm payload generate:types
-          pnpm typecheck   # script: "tsc --noEmit" — verify it exists in package.json
+          pnpm typecheck
 
-      # 6. Execute unit tests (Vitest)
-      - name: Run unit tests
-        run: pnpm test:int -- --reporter=default --reporter=junit --outputFile=test-results/unit.xml
-
-      # 7. Execute integration tests with PostgreSQL
       - name: Run integration tests
         run: pnpm test:int -- --reporter=default --reporter=junit --outputFile=test-results/int.xml
-        env:
-          DATABASE_URI: postgresql://payload:payload@localhost:5432/payload_test
 
-      # Publish test reports (also covers step 13 for tests)
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results
           path: ${{ env.BACKEND_DIR }}/test-results/
+          if-no-files-found: warn # ✅ FIX: Prevents upload failure if tests crashed early
           retention-days: 14
 
-      # 8. Build the application
       - name: Build application
         run: pnpm build
 
@@ -121,15 +110,12 @@ jobs:
           retention-days: 7
 
   # ─────────────────────────────────────────────────────────────
-  # 8–10: Docker image + Trivy scan + SBOM
+  # 2. DOCKER IMAGE + SCAN + SBOM + SMOKE TEST
   # ─────────────────────────────────────────────────────────────
   docker:
     name: Docker · Scan · SBOM
     runs-on: ubuntu-latest
     needs: build-and-test
-    permissions:
-      contents: read
-      security-events: write # for Trivy SARIF upload
 
     outputs:
       image-tag: ${{ steps.meta.outputs.tag }}
@@ -151,7 +137,6 @@ jobs:
             echo "tag=pr-${{ github.event.pull_request.number || 'manual' }}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
-      # 9. Build the Docker image (load locally — push happens only after approval)
       - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
@@ -161,25 +146,27 @@ jobs:
           cache-from: type=gha,scope=bakery-backend
           cache-to: type=gha,mode=max,scope=bakery-backend
 
-                  # 10. Scan dependencies (lockfile) with Trivy (Docker Native)
+      # ✅ FIX: Updated to v0.31.0 to resolve setup-trivy missing version errors
       - name: Trivy — dependency scan
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}/${{ env.BACKEND_DIR }}:/workspace \
-            -v /tmp/trivy-cache:/root/.cache/ \
-            aquasec/trivy:0.58.0 \
-            fs /workspace --format sarif --output /workspace/trivy-deps.sarif --severity CRITICAL,HIGH
-        working-directory: ${{ github.workspace }}
+        uses: aquasecurity/trivy-action@v0.31.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ env.BACKEND_DIR }}/pnpm-lock.yaml
+          format: sarif
+          output: trivy-deps.sarif
+          severity: CRITICAL,HIGH
 
-      # 10b. Scan the built image with Trivy (Docker Native)
       - name: Trivy — image scan
-        run: |
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v /tmp/trivy-cache:/root/.cache/ \
-            aquasec/trivy:0.58.0 \
-            image --format sarif --output trivy-image.sarif --severity CRITICAL,HIGH --ignore-unfixed ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+        uses: aquasecurity/trivy-action@v0.31.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
 
+      # ✅ FIX: Updated to v4 and added hashFiles check to prevent "Path does not exist" crashes
       - name: Upload Trivy results to GitHub Security tab
         if: always() && hashFiles('trivy-image.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
@@ -192,19 +179,19 @@ jobs:
         with:
           name: security-reports
           path: |
-            ${{ env.BACKEND_DIR }}/trivy-deps.sarif
+            trivy-deps.sarif
             trivy-image.sarif
           if-no-files-found: warn
 
-      # Fail the pipeline if the IMAGE has fixable CRITICAL vulnerabilities
       - name: Trivy — gate on critical image vulnerabilities
-        run: |
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v /tmp/trivy-cache:/root/.cache/ \
-            aquasec/trivy:0.58.0 \
-            image --severity CRITICAL --ignore-unfixed --exit-code 1 ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
-      # 11. Generate an SBOM (Syft, SPDX format)
+        uses: aquasecurity/trivy-action@v0.31.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
       - name: Generate SBOM
         uses: anchore/sbom-action@v0.17.2
         with:
@@ -217,14 +204,13 @@ jobs:
         with:
           name: sbom
           path: sbom.spdx.json
-      
-          # 11b. Smoke test — start DB and app, then hit an endpoint
+
+      # ✅ FIX: Bulletproof smoke test with dedicated, guaranteed-to-start PostgreSQL container
       - name: Smoke test
         run: |
           set -euo pipefail
           echo "🚀 Starting PostgreSQL service for smoke test..."
           
-          # 1. Start a dedicated Postgres container for this test
           docker run -d --name smoke-postgres \
             -e POSTGRES_USER=payload \
             -e POSTGRES_PASSWORD=payload \
@@ -238,12 +224,10 @@ jobs:
               echo "✅ PostgreSQL is ready"
               break
             fi
-            echo "Waiting for PostgreSQL... ($i/15)"
             sleep 2
           done
 
           echo "🚀 Starting application container..."
-          # 2. Start the app with --network host so it can reach localhost:5432
           docker run -d --name bakery-smoke \
             --network host \
             -e PAYLOAD_SECRET=smoke-test-secret \
@@ -253,7 +237,6 @@ jobs:
           
           echo "⏳ Waiting for the server to come up (max 60s)..."
           for i in $(seq 1 30); do
-            # Payload CMS root endpoint is the most reliable health check
             if curl -fsS http://localhost:3000/ > /dev/null 2>&1; then
               echo "✅ Smoke test PASSED"
               docker logs bakery-smoke
@@ -261,7 +244,6 @@ jobs:
               docker rm -f smoke-postgres
               exit 0
             fi
-            echo "Waiting for application... (attempt $i/30)"
             sleep 2
           done
           
@@ -270,25 +252,18 @@ jobs:
           docker logs bakery-smoke
           echo "--- PostgreSQL Logs ---"
           docker logs smoke-postgres
-          
           docker rm -f bakery-smoke
           docker rm -f smoke-postgres
           exit 1
-        # NOTE: /api/health must exist — add a Payload health endpoint,
-        # or change the curl URL to an existing route.
 
   # ─────────────────────────────────────────────────────────────
-  # 11–13: Sign · Push to GHCR · Publish reports
+  # 3. SIGN & PUSH TO GHCR
   # ─────────────────────────────────────────────────────────────
   publish:
     name: Sign & Push to GHCR
     runs-on: ubuntu-latest
     needs: docker
-    if: github.ref == 'refs/heads/main' # only publish from main
-    permissions:
-      contents: read
-      packages: write
-      id-token: write # required for Cosign keyless signing
+    if: github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout
@@ -304,7 +279,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 12. Push approved images to GHCR (rebuild with provenance/SBOM attestations)
       - name: Push image to GHCR
         id: push
         uses: docker/build-push-action@v6
@@ -316,7 +290,6 @@ jobs:
             ${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha,scope=bakery-backend
 
-      # 13. Sign published images using Cosign (keyless, via GitHub OIDC)
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
 
@@ -325,46 +298,6 @@ jobs:
           cosign sign --yes \
             ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
-    
-      - name: Diagnose Kubernetes and Payload CMS
-        if: always()
-        env:
-          NAMESPACE: sweetcrumb
-        shell: bash
-        run: |
-          echo "========== CLUSTER INFO =========="
-          # Check if kubectl can actually connect to a cluster
-          if ! kubectl cluster-info > /dev/null 2>&1; then
-            echo "⚠️ WARNING: No Kubernetes cluster is accessible in this job."
-            echo "💡 TIP: Ensure this step is in the 'kubernetes-deployment' job AFTER 'Create Kind cluster'."
-            exit 0
-          fi
-
-          echo "========== KUBERNETES PODS =========="
-          kubectl -n "$NAMESPACE" get pods -o wide || true
-          
-          echo "========== SERVICES =========="
-          kubectl -n "$NAMESPACE" get services || true
-          
-          echo "========== POSTGRESQL STATUS =========="
-          kubectl -n "$NAMESPACE" get statefulsets || true
-          kubectl -n "$NAMESPACE" get deployments || true
-          
-          echo "========== POSTGRESQL LOGS =========="
-          kubectl -n "$NAMESPACE" logs statefulset/postgres --tail=100 || true
-          kubectl -n "$NAMESPACE" logs deployment/postgres --tail=100 || true
-          
-          echo "========== PAYLOAD CMS LOGS =========="
-          kubectl -n "$NAMESPACE" logs deployment/bakery-backend --tail=150 || true
-          
-          echo "========== DATABASE SERVICE =========="
-          kubectl -n "$NAMESPACE" get endpoints postgres || true
-          kubectl -n "$NAMESPACE" get svc postgres || true
-          
-          echo "========== BACKEND ENV VARIABLE NAMES =========="
-          kubectl -n "$NAMESPACE" exec deployment/bakery-backend -- sh -c 'env | grep -E "DATABASE|PAYLOAD" | sort' || true
-
-      # Attach the SBOM to the pushed image (verifiable via cosign verify-attestation)
       - name: Download SBOM
         uses: actions/download-artifact@v4
         with:
@@ -378,7 +311,7 @@ jobs:
             --type spdx \
             ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
-      - name: Verify signature (proves consumers can too)
+      - name: Verify signature
         run: |
           cosign verify \
             --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
@@ -386,28 +319,33 @@ jobs:
             ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
   # ─────────────────────────────────────────────────────────────
-  # 13. Publish build & test reports (aggregated summary)
+  # 4. PUBLISH REPORTS (Fail-Safe)
   # ─────────────────────────────────────────────────────────────
   publish-reports:
     name: Publish Reports
     runs-on: ubuntu-latest
     needs: [build-and-test, docker, publish]
     if: always()
+    
     steps:
+      # ✅ FIX: continue-on-error prevents this job from failing if previous jobs crashed before uploading
       - name: Download test results
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: test-results
           path: reports/tests
 
       - name: Download security reports
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: security-reports
           path: reports/security
 
       - name: Download SBOM
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: sbom
           path: reports/sbom
@@ -417,4 +355,16 @@ jobs:
         with:
           name: pipeline-reports
           path: reports/
+          if-no-files-found: warn # ✅ FIX: Warns instead of failing if directory is empty
           retention-days: 30
+
+      - name: Generate Job Summary
+        if: always()
+        run: |
+          echo "## 📊 Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build & Test | ${{ needs.build-and-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docker & Scan | ${{ needs.docker.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Publish | ${{ needs.publish.result }} |" >> $GITHUB_STEP_SUMMARY
